@@ -59,7 +59,9 @@ DETERMINISTIC_KEYWORDS: list[tuple[str, str, str]] = [
     (r"\bdead[\s\-]?link\b|링크\s*유효성", "dead link 체크 — requests + linkchecker", "#1"),
     (r"\bsha256\b|해시\s*(계산|생성)", "해시 계산 — hashlib", "#1"),
     (r"파일\s*카운트|\bfile\s*count\b", "파일 카운트 — wc / os.listdir", "#19"),
-    (r"\bgrep\b|파일\s*검색", "grep — shell/re 모듈", "#24"),
+    # shell/pipeline grep만 Python — Claude Code 맥락의 semantic grep은 HAIKU_KEYWORDS로 처리
+    (r"(로그|log|출력|output).{0,20}(grep|filter)|grep.{0,20}(로그|log|출력|output)|파일\s*(필터|압축)",
+     "shell/log grep — shell/re 모듈", "#24"),
     (r"\bdate.*(format|정규|normalize)\b|날짜\s*포맷", "날짜 포맷 — dateutil", "#1"),
     (r"\bcross[\s\-]?reference\b.*(매칭|matching|해결|resolve)",
      "cross-ref 매칭 — dict lookup", "#1"),
@@ -70,6 +72,8 @@ DETERMINISTIC_KEYWORDS: list[tuple[str, str, str]] = [
 
 # Haiku 분기 키워드 (탐색·짧은 분류)
 HAIKU_KEYWORDS: list[tuple[str, str, str]] = [
+    # Claude Code 맥락의 grep은 LLM semantic search → Haiku (shell/log grep은 DETERMINISTIC에서 처리)
+    (r"\bgrep\b|파일\s*검색|코드베이스\s*(grep|검색|탐색)", "agent grep/코드베이스 검색 — Haiku (shell grep 아님)", "#2"),
     (r"탐색|\bexplore\b|파일\s*찾", "코드베이스 탐색 — Haiku 빌트인", "#22"),
     (r"짧은.*분류|룰.*분류|\bshort.*classification\b",
      "짧은 룰 기반 분류 — Haiku 충분", "#3"),
@@ -114,6 +118,15 @@ OPUS_KEYWORDS: list[tuple[str, str, str]] = [
      "orchestrator 역할 — Opus 정당", "#10"),
 ]
 
+# 멀티에이전트 환경 재시도 비용 팩터
+# 저렴한 모델 실패 시 재시도 + 동일 phase 전파 비용 추정
+RETRY_FACTORS: dict[str, float] = {
+    "python": 1.0,   # 결정적, 재시도 없음
+    "haiku":  1.25,  # 실패율 높음, phase 전파 고려
+    "sonnet": 1.10,  # 중간 실패율
+    "opus":   1.02,  # 실패율 낮음
+}
+
 # 문자 분량 기반 추정 (--tokens 미제공 시 fallback)
 DEFAULT_TOKENS_BY_TYPE = {
     "python": 200,        # Python 분기는 LLM 호출 없음 (참고용만)
@@ -142,6 +155,11 @@ class Recommendation:
     cost_vs_opus_pct: float
     cost_vs_opus_usd: float
     secondary_options: list[dict]
+    multi_agent: bool
+    retry_factor: float
+    retry_adjusted_cost_usd: float
+    cascade_warning: str
+    maturity_note: str
 
 
 # ─── 결정 트리 ────────────────────────────────────────────────────────────────
@@ -217,7 +235,7 @@ def apply_quality_adjustment(model: str, quality: str) -> tuple[str, bool, str]:
     return (model, False, "")
 
 
-def recommend(task: str, tokens: Optional[int] = None, quality: str = "medium") -> Recommendation:
+def recommend(task: str, tokens: Optional[int] = None, quality: str = "medium", multi_agent: bool = False) -> Recommendation:
     """전체 추천 파이프라인."""
     model, match = select_model(task, quality)
 
@@ -279,6 +297,30 @@ def recommend(task: str, tokens: Optional[int] = None, quality: str = "medium") 
     # 비용 오름차순
     alternatives.sort(key=lambda x: x["estimated_cost_usd"])
 
+    retry_factor = RETRY_FACTORS.get(final_model, 1.0) if multi_agent else 1.0
+    retry_adjusted_cost = round(cost * retry_factor, 4)
+
+    # 멀티에이전트 phase 전파 경고
+    if multi_agent and final_model == "haiku":
+        cascade_warning = (
+            "[WARN] Haiku를 멀티에이전트 phase에 투입 시 실패→재시도가 동일 phase 전체에 전파됩니다. "
+            "재시도 팩터 ×1.25 적용. 작업 난이도가 명확히 낮을 때만 사용하세요. "
+            "(phase 내 에이전트 1개 실패로 전체 +20% 비용 증가 관측)"
+        )
+    elif multi_agent and final_model == "sonnet":
+        cascade_warning = "[INFO] Sonnet 멀티에이전트 — 재시도 팩터 ×1.10 적용."
+    else:
+        cascade_warning = ""
+
+    # 성숙도 게이트: workflow·에이전트 역할이 확정되기 전 단계에서는 티어링 유효하지 않음
+    if final_model in ("haiku", "sonnet") and final_model != "python":
+        maturity_note = (
+            "[NOTE] 모델 티어링은 workflow·에이전트 역할이 확정된 성숙한 하네스에서 유효합니다. "
+            "첫 하네스 구성 단계에서는 Opus로 시작 후 EVAL 결과가 나온 뒤 다운그레이드를 권장합니다."
+        )
+    else:
+        maturity_note = ""
+
     return Recommendation(
         task=task,
         recommended_model=final_model,
@@ -295,6 +337,11 @@ def recommend(task: str, tokens: Optional[int] = None, quality: str = "medium") 
         cost_vs_opus_pct=vs_pct,
         cost_vs_opus_usd=vs_usd,
         secondary_options=alternatives,
+        multi_agent=multi_agent,
+        retry_factor=retry_factor,
+        retry_adjusted_cost_usd=retry_adjusted_cost,
+        cascade_warning=cascade_warning,
+        maturity_note=maturity_note,
     )
 
 
@@ -336,6 +383,19 @@ def render_md(r: Recommendation) -> str:
         delta_str = f"{alt['delta_vs_recommended_usd']:+.4f}"
         lines.append(f"| {alt['model']} | ${alt['estimated_cost_usd']:.4f} | ${delta_str} |")
     lines.append("")
+    if r.multi_agent and r.retry_factor > 1.0:
+        lines.append("## 멀티에이전트 재시도 비용")
+        lines.append("")
+        lines.append(f"- **재시도 팩터:** ×{r.retry_factor}")
+        lines.append(f"- **재시도 보정 비용:** ${r.retry_adjusted_cost_usd:.4f}")
+        if r.cascade_warning:
+            lines.append(f"- {r.cascade_warning}")
+        lines.append("")
+
+    if r.maturity_note:
+        lines.append(f"> {r.maturity_note}")
+        lines.append("")
+
     lines.append("---")
     lines.append("")
     lines.append("_본 추천은 LLM 호출 0회의 결정적 키워드 매칭 결과다. 더 깊은 판단은 task_to_model_matrix.md 24행 전체와 references/anti_patterns_atlas.md를 참조._")
@@ -351,10 +411,12 @@ def main() -> int:
     ap.add_argument("--task", required=True, help="작업 설명 (자연어)")
     ap.add_argument("--tokens", type=int, help="입력 토큰 추정치 (미제공 시 default)")
     ap.add_argument("--quality", choices=["low", "medium", "high"], default="medium")
+    ap.add_argument("--multi-agent", action="store_true",
+                    help="멀티에이전트 phase 투입 여부 — 재시도 비용 및 cascade 경고 활성화")
     ap.add_argument("--json", action="store_true", help="JSON 출력")
     args = ap.parse_args()
 
-    r = recommend(args.task, args.tokens, args.quality)
+    r = recommend(args.task, args.tokens, args.quality, multi_agent=args.multi_agent)
 
     if args.json:
         print(json.dumps(asdict(r), indent=2, ensure_ascii=False))
